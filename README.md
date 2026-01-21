@@ -123,11 +123,53 @@ aws cloudformation describe-stack-events --stack-name kiro-user-management-api -
 
 ## Deployment
 
-### Backend Deployment
+### Recommended: Automated Deployment with AI Code Review
+
+For the safest deployment experience, use an AI coding assistant like Kiro CLI to automatically review the codebase and deploy:
+
+**Using Kiro CLI or similar AI coding tools:**
+
+```bash
+# Open Kiro CLI in this directory and use a prompt like:
+
+"Please thoroughly review the entire codebase for any security vulnerabilities, 
+configuration issues, or potential bugs. Check for:
+- IAM permission issues or overly permissive policies
+- API security configurations and authentication mechanisms
+- Input validation and error handling
+- CloudFormation template syntax and best practices
+- Hardcoded credentials or sensitive data exposure
+- CORS and network security configurations
+
+Fix any critical or high-severity issues you find. If there are unresolved 
+security concerns or blocking issues, stop and report them - do not proceed 
+with deployment.
+
+Once the codebase is verified and any issues are resolved, deploy the 
+application by running:
+1. ./deploy-backend.sh (for backend API and Lambda functions)
+2. ./deploy-frontend.sh (for CloudFront distribution)
+3. ./upload-frontend.sh (to upload web files and invalidate cache)
+
+Provide a summary of any issues found and fixed, and confirm successful deployment."
+```
+
+**Benefits of AI-assisted deployment:**
+- Automated security review before deployment
+- Detection of common misconfigurations
+- Validation of CloudFormation templates
+- Identification of potential runtime issues
+- Safer deployment with pre-flight checks
+
+### Manual Deployment
+
+If you prefer manual deployment or have already completed security reviews:
+
+#### Backend Deployment
 
 The backend deployment script provides a fully automated experience:
 
-#### Quick Start (Fully Automated)
+**Quick Start (Fully Automated)**
 ```bash
 # Run without any parameters - the script will:
 # 1. Auto-detect existing IAM Identity Center instances
@@ -140,7 +182,7 @@ The backend deployment script provides a fully automated experience:
 ./deploy-backend.sh -f
 ```
 
-### Advanced Usage
+**Advanced Usage**
 
 1. **Force update with no prompts**:
    ```bash
@@ -167,7 +209,7 @@ The backend deployment script provides a fully automated experience:
    ./deploy-backend.sh arn:aws:sso:::instance/ssoins-1234567890abcdef my-api-key us-west-2
    ```
 
-### Frontend Deployment
+#### Frontend Deployment
 
 After deploying the backend, deploy the web frontend:
 
@@ -554,19 +596,19 @@ This setup is designed to be cost-effective for moderate usage patterns.
 ├── deploy-frontend.sh         # Frontend deployment script
 ├── upload-frontend.sh         # Upload frontend files to S3
 ├── update-bedrock-prompt.sh   # Update Bedrock prompt in Parameter Store
-├── test_api.py               # API testing script (auto-retrieves credentials)
-├── check_stack.py            # Stack verification script
-├── check_credits.py          # Credit checking script (also deployed as Lambda)
-├── test_check_credits.py     # Test script for credit checking
-├── frontend/                 # Web frontend files
-│   ├── index.html           # Main HTML page
-│   ├── styles.css           # CSS styles
-│   ├── app.js               # Frontend JavaScript logic
-│   └── config.js            # API configuration (auto-generated)
-├── README.md                 # This file
-├── ARCHITECTURE.md           # Complete architecture documentation
-├── CHANGELOG.md              # Change history
-└── archive/                  # Historical documentation files
+├── test_api.py                # API testing script (auto-retrieves credentials)
+├── check_stack.py             # Stack verification script
+├── check_credits.py           # Credit checking script (also deployed as Lambda)
+├── test_check_credits.py      # Test script for credit checking
+├── frontend/                  # Web frontend files
+│   ├── index.html             # Main HTML page
+│   ├── styles.css             # CSS styles
+│   ├── app.js                 # Frontend JavaScript logic
+│   └── config.js              # API configuration (auto-generated)
+├── README.md                  # This file
+├── ARCHITECTURE.md            # Complete architecture documentation
+├── CHANGELOG.md               # Change history
+└── archive/                   # Historical documentation files
 ```
 
 The Lambda function code is embedded directly in the CloudFormation template, making this a completely self-contained deployment with no external dependencies.
