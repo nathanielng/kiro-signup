@@ -324,7 +324,7 @@ else
 
     # Deploy the stack using pure CloudFormation
     aws cloudformation deploy \
-        --template-file template.yaml \
+        --template-file backend-template.yaml \
         --stack-name $STACK_NAME \
         --parameter-overrides \
             IdentityCenterInstanceArn=$IDENTITY_CENTER_INSTANCE_ARN \
