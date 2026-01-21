@@ -103,6 +103,36 @@ document.getElementById('check-credits-form').addEventListener('submit', async f
             body: JSON.stringify(payload)
         });
         
+        // Handle authentication errors
+        if (response.status === 403) {
+            resultDiv.className = 'result error';
+            resultDiv.innerHTML = `
+                <h3>❌ Authentication Failed</h3>
+                <p>Invalid API key. Please check your API key and try again.</p>
+                <p>You can retrieve your API key from AWS Systems Manager Parameter Store at:</p>
+                <code>/kiro/kiro-user-management-api/api-key</code>
+            `;
+            resultDiv.style.display = 'block';
+            submitBtn.disabled = false;
+            btnText.style.display = 'inline';
+            btnLoader.style.display = 'none';
+            return;
+        }
+        
+        // Handle rate limiting
+        if (response.status === 429) {
+            resultDiv.className = 'result error';
+            resultDiv.innerHTML = `
+                <h3>❌ Rate Limit Exceeded</h3>
+                <p>Too many requests. Please wait a moment and try again.</p>
+            `;
+            resultDiv.style.display = 'block';
+            submitBtn.disabled = false;
+            btnText.style.display = 'inline';
+            btnLoader.style.display = 'none';
+            return;
+        }
+        
         const data = await response.json();
         
         if (response.ok) {
@@ -174,17 +204,39 @@ document.getElementById('check-credits-form').addEventListener('submit', async f
             document.getElementById('file-name').textContent = 'Choose a file or drag here';
             document.getElementById('image-preview').style.display = 'none';
         } else {
+            // Handle other HTTP errors
+            let errorMessage = 'Failed to check credits';
+            
+            if (response.status === 400) {
+                errorMessage = data.message || 'Invalid request. Please check your input.';
+            } else if (response.status === 500) {
+                errorMessage = 'Server error. Please try again later.';
+            } else if (data.message) {
+                errorMessage = data.message;
+            }
+            
             resultDiv.className = 'result error';
             resultDiv.innerHTML = `
                 <h3>❌ Error</h3>
-                <p>${data.message || 'Failed to check credits'}</p>
+                <p>${errorMessage}</p>
             `;
         }
     } catch (error) {
+        // Handle network errors
+        let errorMessage = 'Failed to process request';
+        
+        if (error.message === 'Failed to fetch') {
+            errorMessage = 'Unable to connect to the API. Please check your internet connection and ensure the API endpoint is correct.';
+        } else if (error.name === 'TypeError') {
+            errorMessage = 'Network error. Please check your internet connection and try again.';
+        } else {
+            errorMessage = error.message;
+        }
+        
         resultDiv.className = 'result error';
         resultDiv.innerHTML = `
-            <h3>❌ Error</h3>
-            <p>Failed to process request: ${error.message}</p>
+            <h3>❌ Connection Error</h3>
+            <p>${errorMessage}</p>
         `;
     } finally {
         // Re-enable button and hide loader
