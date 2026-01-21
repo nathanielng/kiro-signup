@@ -1,5 +1,20 @@
 # Kiro User Management - Deployment Guide
 
+## ⚠️ Disclaimer
+
+**This code was generated using AI coding tools and is provided as-is for reference purposes.**
+
+Use this code at your own risk. Before deploying:
+- Run security checks and code reviews
+- Test in non-production environments first
+- Review IAM permissions and API configurations
+- Ensure compliance with your organization's policies
+- Implement proper monitoring and backup procedures
+
+The authors are not responsible for any issues or security vulnerabilities.
+
+---
+
 Quick reference guide for deploying and managing the Kiro User Management system.
 
 ## Prerequisites
@@ -101,7 +116,66 @@ export AWS_PROFILE="your-profile"
 
 ## Quick Start
 
-### 1. Deploy Backend
+### Recommended: AI-Assisted Deployment
+
+For the safest deployment, use an AI coding assistant (like Kiro CLI, Claude Code, or similar) to review and deploy:
+
+**Example prompt for Kiro CLI or AI coding tools:**
+
+```
+Please conduct a comprehensive security and code quality review of this entire 
+codebase before deployment. Specifically check for:
+
+1. Security Issues:
+   - IAM permissions (ensure least privilege)
+   - API authentication and authorization mechanisms
+   - Input validation and sanitization
+   - Secrets management and credential exposure
+   - CORS and network security configurations
+   - S3 bucket policies and CloudFront OAC settings
+
+2. Configuration Issues:
+   - CloudFormation template syntax and best practices
+   - Lambda function configurations and timeouts
+   - API Gateway rate limiting and throttling
+   - Resource naming and tagging
+
+3. Code Quality:
+   - Error handling and logging
+   - Python code quality and potential bugs
+   - Bash script safety and error handling
+
+Fix any critical or high-severity issues you identify. If there are unresolved 
+security vulnerabilities or blocking issues, STOP and report them - do not 
+proceed with deployment.
+
+Once the codebase passes all security checks and any issues are resolved, 
+deploy the application by executing these commands in order:
+1. ./deploy-backend.sh
+2. ./deploy-frontend.sh  
+3. ./upload-frontend.sh
+
+After deployment, verify that all resources are created successfully and 
+provide a summary of:
+- Issues found and fixed
+- Deployment status
+- CloudFront URL for accessing the application
+- Any recommendations for post-deployment security hardening
+```
+
+**Why use AI-assisted deployment?**
+- Automated pre-deployment security scanning
+- Detection of common misconfigurations and vulnerabilities
+- CloudFormation template validation
+- Identification of potential runtime issues
+- Safer deployment with comprehensive pre-flight checks
+- Documentation of issues found and resolved
+
+### Manual Deployment
+
+If you've already completed security reviews or performed the necessary checks for a manual deployment:
+
+#### 1. Deploy Backend
 ```bash
 ./deploy-backend.sh
 ```
@@ -111,7 +185,7 @@ This will:
 - Deploy Lambda functions, API Gateway, S3 bucket
 - Store credentials in Parameter Store
 
-### 2. Deploy Frontend
+#### 2. Deploy Frontend
 ```bash
 ./deploy-frontend.sh
 ./upload-frontend.sh
@@ -121,7 +195,7 @@ This will:
 - Configure S3 bucket for frontend hosting
 - Upload web files and invalidate cache
 
-### 3. Access the Application
+#### 3. Access the Application
 ```bash
 # Get CloudFront URL
 aws cloudformation describe-stacks \
