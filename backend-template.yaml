@@ -1,0 +1,1169 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM Identity Center User Management API'
+
+Parameters:
+  IdentityCenterInstanceArn:
+    Type: String
+    Description: ARN of the IAM Identity Center instance
+    Default: ''
+  
+  ApiKeyValue:
+    Type: String
+    Description: API Key for authentication
+    NoEcho: true
+    MinLength: 20
+
+Resources:
+  # IAM Role for Lambda function
+  UserManagementLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IdentityCenterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sso-admin:*
+                  - identitystore:*
+                  - sso:ListInstances
+                Resource: '*'
+
+  # IAM Role for Check Credits Lambda function
+  CheckCreditsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAndS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::kiro-user-management-api-screenshots-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::kiro-user-management-api-screenshots-${AWS::AccountId}/*'
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-user-management'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/kiro/${AWS::StackName}/bedrock-prompt'
+              - Effect: Allow
+                Action:
+                  - sso:ListInstances
+                  - identitystore:ListUsers
+                  - identitystore:ListGroups
+                  - identitystore:ListGroupMemberships
+                Resource: '*'
+
+  # Lambda function for user management
+  UserManagementFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-user-management'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt UserManagementLambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from botocore.exceptions import ClientError
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          identitystore_client = boto3.client('identitystore')
+          sso_admin_client = boto3.client('sso-admin')
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to create IAM Identity Center users and add them to Kiro Pro group.
+              If existing_user_id is provided, skip user creation and just add to group.
+              """
+              try:
+                  # Parse request body
+                  if 'body' in event:
+                      body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+                  else:
+                      body = event
+                  
+                  # Check if we have an existing user ID (skip creation)
+                  existing_user_id = body.get('existing_user_id')
+                  
+                  # Validate required fields
+                  required_fields = ['name', 'email']
+                  for field in required_fields:
+                      if field not in body:
+                          return create_response(400, f"Missing required field: {field}")
+                  
+                  # Extract user information
+                  name = body['name']
+                  email = body['email']
+                  first_name = body.get('firstName', name.split()[0] if ' ' in name else name)
+                  last_name = body.get('lastName', name.split()[-1] if ' ' in name and len(name.split()) > 1 else '')
+                  
+                  # Get Identity Center instance ARN from environment
+                  instance_arn = os.environ.get('IDENTITY_CENTER_INSTANCE_ARN')
+                  if not instance_arn:
+                      return create_response(500, "Identity Center instance ARN not configured")
+                  
+                  # Extract identity store ID from instance ARN
+                  identity_store_id = get_identity_store_id(instance_arn)
+                  
+                  if not identity_store_id:
+                      return create_response(500, "Failed to get Identity Store ID from Identity Center instance")
+                  
+                  # If existing_user_id provided, skip user creation
+                  if existing_user_id:
+                      user_id = existing_user_id
+                      logger.info(f"Using existing user ID: {user_id}")
+                  else:
+                      # Create user in Identity Center
+                      user_result = create_identity_center_user(
+                          identity_store_id, 
+                          name, 
+                          email, 
+                          first_name, 
+                          last_name
+                      )
+                      
+                      if not user_result['success']:
+                          return create_response(500, user_result['error'])
+                      
+                      user_id = user_result['user_id']
+                  
+                  # Get Kiro Pro group ID
+                  kiro_pro_group_id = get_kiro_pro_group_id(identity_store_id)
+                  if not kiro_pro_group_id:
+                      return create_response(500, "Kiro Pro group not found")
+                  
+                  # Add user to Kiro Pro group
+                  group_result = add_user_to_group(identity_store_id, user_id, kiro_pro_group_id)
+                  
+                  if not group_result['success']:
+                      return create_response(500, group_result['error'])
+                  
+                  return create_response(200, {
+                      "message": "User created successfully" if not existing_user_id else "User added to Kiro Pro successfully",
+                      "user_id": user_id,
+                      "email": email,
+                      "group": "Kiro Pro"
+                  })
+                  
+              except json.JSONDecodeError:
+                  return create_response(400, "Invalid JSON in request body")
+              except Exception as e:
+                  logger.error(f"Unexpected error: {str(e)}")
+                  return create_response(500, f"Internal server error: {str(e)}")
+
+          def get_identity_store_id(instance_arn):
+              """Extract identity store ID from Identity Center instance"""
+              try:
+                  response = sso_admin_client.list_instances()
+                  
+                  # If no instances found, return None
+                  if not response['Instances']:
+                      logger.error("No Identity Center instances found")
+                      return None
+                  
+                  # Try to find matching instance by ARN
+                  for instance in response['Instances']:
+                      if instance['InstanceArn'] == instance_arn:
+                          return instance['IdentityStoreId']
+                  
+                  # If no match found, use the first available instance
+                  # This handles cases where the ARN format might differ
+                  logger.warning(f"Instance ARN {instance_arn} not found, using first available instance")
+                  return response['Instances'][0]['IdentityStoreId']
+                  
+              except ClientError as e:
+                  logger.error(f"Error getting identity store ID: {e}")
+                  return None
+
+          def create_identity_center_user(identity_store_id, name, email, first_name, last_name):
+              """Create a new user in IAM Identity Center"""
+              try:
+                  # Check if user already exists
+                  existing_user = find_user_by_email(identity_store_id, email)
+                  if existing_user:
+                      return {
+                          'success': False,
+                          'error': f"User with email {email} already exists"
+                      }
+                  
+                  # Create user
+                  response = identitystore_client.create_user(
+                      IdentityStoreId=identity_store_id,
+                      UserName=email,  # Use email as username
+                      Name={
+                          'GivenName': first_name,
+                          'FamilyName': last_name,
+                          'Formatted': name
+                      },
+                      DisplayName=name,
+                      Emails=[
+                          {
+                              'Value': email,
+                              'Type': 'work',
+                              'Primary': True
+                          }
+                      ]
+                  )
+                  
+                  return {
+                      'success': True,
+                      'user_id': response['UserId']
+                  }
+                  
+              except ClientError as e:
+                  error_code = e.response.get('Error', {}).get('Code', '')
+                  
+                  # Handle duplicate user error with a friendly message
+                  if error_code == 'ConflictException':
+                      logger.error(f"Duplicate user detected for email: {email}")
+                      return {
+                          'success': False,
+                          'error': f"User with email {email} already exists"
+                      }
+                  
+                  logger.error(f"Error creating user: {e}")
+                  return {
+                      'success': False,
+                      'error': f"Failed to create user: {str(e)}"
+                  }
+
+          def find_user_by_email(identity_store_id, email):
+              """Find user by email address"""
+              try:
+                  response = identitystore_client.list_users(
+                      IdentityStoreId=identity_store_id,
+                      Filters=[
+                          {
+                              'AttributePath': 'emails.value',
+                              'AttributeValue': email
+                          }
+                      ]
+                  )
+                  
+                  return response['Users'][0] if response['Users'] else None
+                  
+              except ClientError as e:
+                  logger.error(f"Error finding user: {e}")
+                  return None
+
+          def get_kiro_pro_group_id(identity_store_id):
+              """Get the Kiro Pro group ID"""
+              try:
+                  # First try to get from environment variable
+                  group_id = os.environ.get('KIRO_PRO_GROUP_ID')
+                  if group_id and group_id != 'PLACEHOLDER_GROUP_ID':
+                      return group_id
+                  
+                  # If not in env, search for the group
+                  response = identitystore_client.list_groups(
+                      IdentityStoreId=identity_store_id,
+                      Filters=[
+                          {
+                              'AttributePath': 'displayName',
+                              'AttributeValue': 'Kiro Pro'
+                          }
+                      ]
+                  )
+                  
+                  if response['Groups']:
+                      return response['Groups'][0]['GroupId']
+                  
+                  # If group doesn't exist, create it
+                  create_response = identitystore_client.create_group(
+                      IdentityStoreId=identity_store_id,
+                      DisplayName='Kiro Pro',
+                      Description='Kiro Pro users group'
+                  )
+                  
+                  return create_response['GroupId']
+                  
+              except ClientError as e:
+                  logger.error(f"Error getting/creating Kiro Pro group: {e}")
+                  return None
+
+          def add_user_to_group(identity_store_id, user_id, group_id):
+              """Add user to a group"""
+              try:
+                  identitystore_client.create_group_membership(
+                      IdentityStoreId=identity_store_id,
+                      GroupId=group_id,
+                      MemberId={
+                          'UserId': user_id
+                      }
+                  )
+                  
+                  return {'success': True}
+                  
+              except ClientError as e:
+                  logger.error(f"Error adding user to group: {e}")
+                  return {
+                      'success': False,
+                      'error': str(e)
+                  }
+
+          def create_response(status_code, body):
+              """Create HTTP response"""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                  },
+                  'body': json.dumps(body) if isinstance(body, dict) else json.dumps({'message': body})
+              }
+      Environment:
+        Variables:
+          IDENTITY_CENTER_INSTANCE_ARN: !Ref IdentityCenterInstanceArn
+
+  # Lambda function for checking credits
+  CheckCreditsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-check-credits'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckCreditsLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import base64
+          import hashlib
+          import json
+          import logging
+          import os
+          from datetime import datetime
+          
+          import boto3
+          from botocore.exceptions import ClientError
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function to check if Kiro credits are used up by analyzing screenshots.
+              Logic flow:
+              1. Check if user exists in IAM Identity Center
+              2. If exists, check if already in Kiro Pro group
+              3. If not in Kiro Pro, check if credits are depleted
+              4. If depleted, add user to Kiro Pro group
+              """
+              try:
+                  # Parse request body
+                  if 'body' in event:
+                      body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+                  else:
+                      body = event
+                  
+                  # Validate required fields
+                  if 'image' not in body:
+                      return create_response(400, "Missing required field: image (base64 encoded)")
+                  
+                  if 'email' not in body:
+                      return create_response(400, "Missing required field: email")
+                  
+                  # Get required fields
+                  image_base64 = body['image']
+                  email = body['email']
+                  
+                  # Get optional fields
+                  first_name = body.get('firstName', '')
+                  last_name = body.get('lastName', '')
+                  image_name = body.get('image_name', 'screenshot.png')
+                  
+                  # Step 1: Check if user exists and if they're already in Kiro Pro
+                  user_status = check_user_kiro_pro_status(email)
+                  
+                  # Step 2: If user already in Kiro Pro, return early with simple message
+                  if user_status['in_kiro_pro']:
+                      return create_response(200, {
+                          "email": email,
+                          "already_in_kiro_pro": True,
+                          "message": "You are already on the Kiro Pro plan."
+                      })
+                  
+                  # Initialize response data for non-Kiro Pro users
+                  response_data = {
+                      "email": email,
+                      "user_exists": user_status['user_exists'],
+                      "already_in_kiro_pro": False
+                  }
+                  
+                  # Step 3: Check if credits are depleted AND email matches
+                  credits_result = check_credits_used_up(image_base64, email, image_name)
+                  
+                  response_data['email_match'] = credits_result['email_match']
+                  response_data['credits_used_up'] = credits_result['credits_used_up']
+                  response_data['s3_uri'] = credits_result.get('s3_uri')
+                  response_data['timestamp'] = credits_result['timestamp']
+                  
+                  # Step 4a: If email doesn't match, deny access
+                  if not credits_result['email_match']:
+                      response_data['user_added_to_kiro_pro'] = False
+                      response_data['message'] = "Email verification failed. The email in the screenshot does not match the provided email address. Please ensure you're submitting your own screenshot."
+                      return create_response(200, response_data)
+                  
+                  # Step 4b: If credits NOT depleted, return early
+                  if not credits_result['credits_used_up']:
+                      response_data['user_added_to_kiro_pro'] = False
+                      response_data['message'] = "Credits are still available. Please use up your free credits before requesting Kiro Pro access."
+                      return create_response(200, response_data)
+                  
+                  # Step 5: Email matches AND credits are depleted, add user to Kiro Pro
+                  logger.info(f"Email verified and credits depleted for {email}. Adding to Kiro Pro group...")
+                  
+                  user_result = add_user_to_kiro_pro(email, first_name, last_name, user_status['user_id'])
+                  
+                  if user_result['success']:
+                      response_data['user_added_to_kiro_pro'] = True
+                      response_data['message'] = f"Credits depleted. User {email} successfully added to Kiro Pro group."
+                      response_data['user_id'] = user_result.get('user_id')
+                  else:
+                      # Check if the error is because user already exists
+                      # If so, verify if they're already in Kiro Pro group
+                      if 'already exists' in user_result.get('error', '').lower():
+                          logger.info(f"User {email} already exists. Checking Kiro Pro membership...")
+                          # Re-check if user is in Kiro Pro (they might have been added between checks)
+                          updated_status = check_user_kiro_pro_status(email)
+                          if updated_status['in_kiro_pro']:
+                              # User is already in Kiro Pro, treat as success
+                              response_data['already_in_kiro_pro'] = True
+                              response_data['user_added_to_kiro_pro'] = False  # Wasn't added now, already was
+                              response_data['message'] = "You are already on the Kiro Pro plan."
+                              return create_response(200, response_data)
+                      
+                      # Other error or user exists but not in Kiro Pro
+                      response_data['user_added_to_kiro_pro'] = False
+                      response_data['message'] = f"Credits depleted, but failed to add user to Kiro Pro group: {user_result['error']}"
+                      response_data['error'] = user_result['error']
+                  
+                  return create_response(200, response_data)
+                  
+              except json.JSONDecodeError:
+                  return create_response(400, "Invalid JSON in request body")
+              except Exception as e:
+                  logger.error(f"Unexpected error: {str(e)}")
+                  return create_response(500, f"Internal server error: {str(e)}")
+          
+          def check_user_kiro_pro_status(email):
+              """
+              Check if user exists in IAM Identity Center and if they're in Kiro Pro group.
+              
+              Args:
+                  email: User's email address
+              
+              Returns:
+                  dict: {
+                      'user_exists': bool,
+                      'user_id': str or None,
+                      'in_kiro_pro': bool
+                  }
+              """
+              try:
+                  # Get Identity Center configuration
+                  lambda_client = boto3.client('lambda')
+                  user_management_function = os.environ.get('USER_MANAGEMENT_FUNCTION_NAME')
+                  
+                  if not user_management_function:
+                      logger.error("User management function name not configured")
+                      return {
+                          'user_exists': False,
+                          'user_id': None,
+                          'in_kiro_pro': False
+                      }
+                  
+                  # Get Identity Store ID by invoking a helper in user management
+                  # We'll use identitystore client directly
+                  identitystore_client = boto3.client('identitystore')
+                  sso_admin_client = boto3.client('sso-admin')
+                  
+                  # Get Identity Store ID from SSO instances
+                  instances = sso_admin_client.list_instances()
+                  if not instances['Instances']:
+                      logger.error("No Identity Center instances found")
+                      return {
+                          'user_exists': False,
+                          'user_id': None,
+                          'in_kiro_pro': False
+                      }
+                  
+                  identity_store_id = instances['Instances'][0]['IdentityStoreId']
+                  
+                  # Check if user exists
+                  response = identitystore_client.list_users(
+                      IdentityStoreId=identity_store_id,
+                      Filters=[
+                          {
+                              'AttributePath': 'userName',
+                              'AttributeValue': email
+                          }
+                      ]
+                  )
+                  
+                  if not response['Users']:
+                      # User doesn't exist
+                      return {
+                          'user_exists': False,
+                          'user_id': None,
+                          'in_kiro_pro': False
+                      }
+                  
+                  user = response['Users'][0]
+                  user_id = user['UserId']
+                  
+                  # User exists, now check if they're in Kiro Pro group
+                  # Get Kiro Pro group ID
+                  groups_response = identitystore_client.list_groups(
+                      IdentityStoreId=identity_store_id,
+                      Filters=[
+                          {
+                              'AttributePath': 'displayName',
+                              'AttributeValue': 'Kiro Pro'
+                          }
+                      ]
+                  )
+                  
+                  if not groups_response['Groups']:
+                      # Kiro Pro group doesn't exist yet
+                      return {
+                          'user_exists': True,
+                          'user_id': user_id,
+                          'in_kiro_pro': False
+                      }
+                  
+                  kiro_pro_group_id = groups_response['Groups'][0]['GroupId']
+                  
+                  # Check if user is member of Kiro Pro group
+                  memberships = identitystore_client.list_group_memberships(
+                      IdentityStoreId=identity_store_id,
+                      GroupId=kiro_pro_group_id,
+                      MaxResults=100
+                  )
+                  
+                  # Check if user is in the memberships
+                  for membership in memberships.get('GroupMemberships', []):
+                      if membership['MemberId']['UserId'] == user_id:
+                          return {
+                              'user_exists': True,
+                              'user_id': user_id,
+                              'in_kiro_pro': True
+                          }
+                  
+                  # User exists but not in Kiro Pro group
+                  return {
+                      'user_exists': True,
+                      'user_id': user_id,
+                      'in_kiro_pro': False
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error checking user Kiro Pro status: {e}")
+                  return {
+                      'user_exists': False,
+                      'user_id': None,
+                      'in_kiro_pro': False
+                  }
+          
+          def add_user_to_kiro_pro(email, first_name='', last_name='', existing_user_id=None):
+              """
+              Invoke the user management Lambda to add user to Kiro Pro group.
+              
+              Args:
+                  email: User's email address
+                  first_name: User's first name (optional)
+                  last_name: User's last name (optional)
+              
+              Returns:
+                  dict: Result with success boolean and optional error message
+              """
+              try:
+                  lambda_client = boto3.client('lambda')
+                  user_management_function = os.environ.get('USER_MANAGEMENT_FUNCTION_NAME')
+                  
+                  if not user_management_function:
+                      return {
+                          'success': False,
+                          'error': 'User management function name not configured'
+                      }
+                  
+                  # If names not provided, extract from email
+                  if not first_name or not last_name:
+                      email_local = email.split('@')[0]
+                      name_parts = email_local.replace('.', ' ').replace('_', ' ').split()
+                      
+                      if not first_name:
+                          first_name = name_parts[0].title() if name_parts else email_local.title()
+                      
+                      if not last_name:
+                          if len(name_parts) >= 2:
+                              last_name = ' '.join(name_parts[1:]).title()
+                          else:
+                              last_name = "User"
+                  
+                  name = f"{first_name} {last_name}"
+                  
+                  # Prepare payload for user management Lambda
+                  payload = {
+                      'name': name,
+                      'email': email,
+                      'firstName': first_name,
+                      'lastName': last_name
+                  }
+                  
+                  # If existing user ID provided, include it to skip user creation
+                  if existing_user_id:
+                      payload['existing_user_id'] = existing_user_id
+                  
+                  # Invoke user management Lambda
+                  response = lambda_client.invoke(
+                      FunctionName=user_management_function,
+                      InvocationType='RequestResponse',
+                      Payload=json.dumps(payload)
+                  )
+                  
+                  # Parse response
+                  response_payload = json.loads(response['Payload'].read())
+                  
+                  if response_payload.get('statusCode') == 200:
+                      body = json.loads(response_payload['body'])
+                      return {
+                          'success': True,
+                          'user_id': body.get('user_id')
+                      }
+                  else:
+                      body = json.loads(response_payload.get('body', '{}'))
+                      error_message = body.get('message', 'Unknown error')
+                      return {
+                          'success': False,
+                          'error': error_message
+                      }
+                  
+              except ClientError as e:
+                  logger.error(f"Error invoking user management Lambda: {e}")
+                  return {
+                      'success': False,
+                      'error': f"Failed to invoke user management: {str(e)}"
+                  }
+              except Exception as e:
+                  logger.error(f"Unexpected error adding user to Kiro Pro: {e}")
+                  return {
+                      'success': False,
+                      'error': str(e)
+                  }
+          
+          def get_s3_bucket_name():
+              """Get S3 bucket name from environment or construct default."""
+              bucket_name = os.environ.get('KIRO_S3_BUCKET')
+              
+              if bucket_name:
+                  return bucket_name
+              
+              # Get AWS account ID
+              sts = boto3.client('sts')
+              account_id = sts.get_caller_identity()['Account']
+              
+              return f"kiro-user-management-api-screenshots-{account_id}"
+          
+          def generate_s3_key(email, credits_used_up=False):
+              """Generate S3 key with timestamp and sanitized email in screenshots/ folder."""
+              # Get current timestamp
+              timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+              
+              # Sanitize email for use in S3 key (replace invalid characters)
+              sanitized_email = email.replace('@', '_at_').replace('.', '_').replace('+', '_plus_')
+              # Remove any other potentially problematic characters
+              sanitized_email = ''.join(c for c in sanitized_email if c.isalnum() or c in ('_', '-'))
+              
+              # Add "deny" suffix if credits are not used up (upgrade request denied)
+              status_suffix = "" if credits_used_up else "-deny"
+              
+              return f"screenshots/{timestamp}-{sanitized_email}{status_suffix}.png"
+          
+          def save_image_to_s3(image_data, bucket_name, s3_key, email):
+              """Upload image to S3 bucket for audit purposes."""
+              s3 = boto3.client('s3')
+              
+              try:
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=s3_key,
+                      Body=image_data,
+                      ContentType='image/png',
+                      Metadata={
+                          'email': email,
+                          'upload_timestamp': datetime.now().isoformat()
+                      }
+                  )
+                  
+                  return f"s3://{bucket_name}/{s3_key}"
+              except ClientError as e:
+                  logger.error(f"Error saving to S3: {e}")
+                  return None
+          
+          def check_credits_used_up(image_base64, email, image_name):
+              """
+              Analyze a Kiro credit screenshot to determine if credits are used up.
+              Also verifies that the email in the screenshot matches the provided email.
+              
+              Args:
+                  image_base64: Base64 encoded image data
+                  email: User's email address to verify
+                  image_name: Name of the image for logging
+              
+              Returns:
+                  dict: Result with credits_used_up boolean, email_match boolean, s3_uri, and timestamp
+              """
+              # Decode base64 image
+              try:
+                  image_data = base64.b64decode(image_base64)
+              except Exception as e:
+                  logger.error(f"Error decoding base64 image: {e}")
+                  raise ValueError("Invalid base64 image data")
+              
+              # Initialize Bedrock client
+              bedrock = boto3.client('bedrock-runtime', region_name='us-west-2')
+              
+              # Try to get prompt from Parameter Store, fall back to default
+              ssm = boto3.client('ssm')
+              try:
+                  response = ssm.get_parameter(
+                      Name='/kiro/kiro-user-management-api/bedrock-prompt',
+                      WithDecryption=False
+                  )
+                  prompt_template = response['Parameter']['Value']
+                  logger.info("Using Bedrock prompt from Parameter Store")
+              except Exception as e:
+                  logger.warning(f"Could not retrieve prompt from Parameter Store: {e}. Using default prompt.")
+                  prompt_template = "Please check if all of the user's credits have been fully utilized. Respond with MATCH,YES or NOMATCH,NO."
+              
+              # Construct the prompt with email substitution
+              prompt = prompt_template.replace('{email}', email)
+              
+              # Prepare the request body for Nova Pro
+              request_body = {
+                  "messages": [
+                      {
+                          "role": "user",
+                          "content": [
+                              {
+                                  "image": {
+                                      "format": "png",
+                                      "source": {
+                                          "bytes": image_base64
+                                      }
+                                  }
+                              },
+                              {
+                                  "text": prompt
+                              }
+                          ]
+                      }
+                  ],
+                  "inferenceConfig": {
+                      "max_new_tokens": 10,
+                      "temperature": 0.0
+                  }
+              }
+              
+              # Invoke Bedrock using inference profile
+              response = bedrock.invoke_model(
+                  modelId='us.amazon.nova-pro-v1:0',
+                  body=json.dumps(request_body),
+                  contentType='application/json',
+                  accept='application/json'
+              )
+              
+              # Parse response
+              response_body = json.loads(response['body'].read())
+              answer = response_body['output']['message']['content'][0]['text'].strip().upper()
+              
+              # Parse the two-part response: "MATCH,YES" or "NOMATCH,NO" etc.
+              parts = answer.split(',')
+              if len(parts) != 2:
+                  logger.error(f"Unexpected Bedrock response format: {answer}")
+                  # Default to safe values
+                  email_match = False
+                  credits_used_up = False
+              else:
+                  email_match = parts[0].strip() == 'MATCH'
+                  credits_used_up = parts[1].strip() == 'YES'
+              
+              logger.info(f"Bedrock analysis - Email match: {email_match}, Credits depleted: {credits_used_up}")
+              
+              # Determine S3 key suffix based on result
+              # If email doesn't match, always use -deny suffix
+              if not email_match:
+                  s3_suffix_credits_status = False  # Always deny if email doesn't match
+              else:
+                  s3_suffix_credits_status = credits_used_up
+              
+              # Save image to S3 for audit purposes (after determining status)
+              s3_uri = None
+              try:
+                  bucket_name = get_s3_bucket_name()
+                  s3_key = generate_s3_key(email, s3_suffix_credits_status)
+                  s3_uri = save_image_to_s3(image_data, bucket_name, s3_key, email)
+                  logger.info(f"Image saved to S3: {s3_uri}")
+              except Exception as e:
+                  logger.warning(f"Failed to save image to S3: {e}")
+              
+              # Return result
+              return {
+                  'email_match': email_match,
+                  'credits_used_up': credits_used_up,
+                  's3_uri': s3_uri,
+                  'timestamp': datetime.now().isoformat()
+              }
+          
+          def create_response(status_code, body):
+              """Create HTTP response"""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                  },
+                  'body': json.dumps(body) if isinstance(body, dict) else json.dumps({'message': body})
+              }
+      Environment:
+        Variables:
+          KIRO_S3_BUCKET: !Sub 'kiro-user-management-api-screenshots-${AWS::AccountId}'
+          USER_MANAGEMENT_FUNCTION_NAME: !Ref UserManagementFunction
+
+  # API Gateway
+  UserManagementApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      Description: 'IAM Identity Center User Management API'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resource for create-user
+  CreateUserResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UserManagementApi
+      ParentId: !GetAtt UserManagementApi.RootResourceId
+      PathPart: create-user
+
+  # API Gateway Resource for check-credits
+  CheckCreditsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UserManagementApi
+      ParentId: !GetAtt UserManagementApi.RootResourceId
+      PathPart: check-credits
+
+  # API Gateway Method
+  CreateUserMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UserManagementApi
+      ResourceId: !Ref CreateUserResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserManagementFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: 400
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: 500
+          ResponseModels:
+            application/json: Empty
+
+  # OPTIONS method for CORS
+  CreateUserOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UserManagementApi
+      ResourceId: !Ref CreateUserResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway Method for check-credits
+  CheckCreditsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UserManagementApi
+      ResourceId: !Ref CheckCreditsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CheckCreditsFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: 400
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: 500
+          ResponseModels:
+            application/json: Empty
+
+  # OPTIONS method for CORS on check-credits
+  CheckCreditsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UserManagementApi
+      ResourceId: !Ref CheckCreditsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CreateUserMethod
+      - CreateUserOptionsMethod
+      - CheckCreditsMethod
+      - CheckCreditsOptionsMethod
+    Properties:
+      RestApiId: !Ref UserManagementApi
+      StageName: prod
+
+  # API Key
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub '${AWS::StackName}-api-key'
+      Description: API Key for User Management API
+      Enabled: true
+      Value: !Ref ApiKeyValue
+
+  # Usage Plan
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiDeployment
+    Properties:
+      UsagePlanName: !Sub '${AWS::StackName}-usage-plan'
+      Description: Usage plan for User Management API
+      ApiStages:
+        - ApiId: !Ref UserManagementApi
+          Stage: prod
+      Throttle:
+        RateLimit: 1
+        BurstLimit: 5
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+  # Link API Key to Usage Plan
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  # Lambda permission for API Gateway
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UserManagementFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserManagementApi}/*/*'
+
+  # Lambda permission for API Gateway (check-credits)
+  CheckCreditsLambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CheckCreditsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserManagementApi}/*/*'
+
+  # S3 Bucket for screenshot storage
+  # Store API Key securely in Parameter Store
+  ApiKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/kiro/${AWS::StackName}/api-key'
+      Type: String
+      Tier: Advanced
+      Value: !Ref ApiKeyValue
+      Description: 'API Key for IAM Identity Center User Management API'
+
+  # SSM Parameter to store group ID (Lambda will update this)
+  KiroProGroupParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/kiro/${AWS::StackName}/kiro-pro-group-id'
+      Type: String
+      Value: 'PLACEHOLDER_GROUP_ID'
+      Description: 'Group ID for Kiro Pro group in Identity Center'
+
+  # SSM Parameter to store Bedrock prompt
+  BedrockPromptParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/kiro/${AWS::StackName}/bedrock-prompt'
+      Type: String
+      Value: |
+        Analyze this screenshot of Kiro free credits usage.
+
+        IMPORTANT - You must check TWO things.
+
+        1. EMAIL VERIFICATION
+           - Look for the email address displayed in the screenshot
+           - The email should be {email}
+           - Check if the email in the screenshot EXACTLY matches this email
+
+        2. CREDITS VERIFICATION
+           - Kiro provides two types of credits
+             a) 500 bonus credits (one-time, if shown in the image)
+             b) 50 monthly credits (recurring)
+           - Check if ALL available free credits have been completely used up
+             * If the image shows 500 bonus credits, they must be fully used (0 remaining)
+             * The 50 monthly credits must be fully used (0 remaining)
+             * BOTH types of credits must be depleted for qualification
+
+        Respond with ONLY TWO words separated by a comma.
+        - First word - MATCH if the email in the screenshot matches {email}, or NOMATCH if it does not match or is not visible
+        - Second word - YES if ALL free credits are completely used up, or NO if any credits remain
+
+        Examples of valid responses
+        - MATCH,YES means email matches and all credits depleted
+        - MATCH,NO means email matches but credits still available
+        - NOMATCH,YES means email does not match (even if credits depleted)
+        - NOMATCH,NO means email does not match and credits available
+
+        Your response
+      Description: 'Bedrock prompt template for credit verification (use {email} as placeholder)'
+
+Outputs:
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${UserManagementApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  
+  CreateUserEndpoint:
+    Description: 'Create User endpoint'
+    Value: !Sub 'https://${UserManagementApi}.execute-api.${AWS::Region}.amazonaws.com/prod/create-user'
+  
+  CheckCreditsEndpoint:
+    Description: 'Check Credits endpoint'
+    Value: !Sub 'https://${UserManagementApi}.execute-api.${AWS::Region}.amazonaws.com/prod/check-credits'
+  
+  ApiKeyParameterName:
+    Description: 'SSM Parameter name containing the API key (SecureString)'
+    Value: !Ref ApiKeyParameter
+  
+  BedrockPromptParameterName:
+    Description: 'SSM Parameter name containing the Bedrock prompt template'
+    Value: !Ref BedrockPromptParameter
+  
+  ApiKeyId:
+    Description: 'API Key ID'
+    Value: !Ref ApiKey
+  
+  UserManagementLambdaArn:
+    Description: 'User Management Lambda Function ARN'
+    Value: !GetAtt UserManagementFunction.Arn
+  
+  CheckCreditsLambdaArn:
+    Description: 'Check Credits Lambda Function ARN'
+    Value: !GetAtt CheckCreditsFunction.Arn
