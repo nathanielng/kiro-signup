@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kiro User Management</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 Kiro User Management</h1>
+            <p class="subtitle">Manage users and check credit status</p>
+        </header>
+
+        <!-- API Configuration Card -->
+        <div class="card api-config-card">
+            <h3>🔑 API Configuration</h3>
+            <div class="form-group api-key-group">
+                <label for="api-key-input">API Key *</label>
+                <div class="api-key-input-wrapper">
+                    <input type="password" id="api-key-input" placeholder="Enter your API key" required>
+                    <button type="button" class="btn-toggle-key" onclick="toggleApiKeyVisibility()">
+                        <span id="toggle-icon">👁️</span>
+                    </button>
+                </div>
+            </div>
+            <p class="api-hint">Your API key is required to authenticate requests. It will be stored in your browser session.</p>
+        </div>
+
+        <!-- Kiro Pro Tab -->
+        <div id="check-credits-tab" class="tab-content active">
+            <div class="card">
+                <h2>Request Access to Kiro Pro</h2>
+                <p class="description">Upload a screenshot to verify your Kiro credits are depleted and get upgraded to Kiro Pro</p>
+                
+                <form id="check-credits-form">
+                    <div class="form-group">
+                        <label for="credits-email">Email *</label>
+                        <input type="email" id="credits-email" required placeholder="user@example.com">
+                    </div>
+                    
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="credits-firstname">First Name</label>
+                            <input type="text" id="credits-firstname" placeholder="John">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="credits-lastname">Last Name</label>
+                            <input type="text" id="credits-lastname" placeholder="Doe">
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="screenshot-upload">Screenshot (PNG) *</label>
+                        <div class="file-upload">
+                            <input type="file" id="screenshot-upload" accept="image/png" required>
+                            <div class="file-upload-label">
+                                <span id="file-name">Choose a file or drag here</span>
+                            </div>
+                        </div>
+                        <div id="image-preview" style="display: none;">
+                            <img id="preview-img" alt="Preview">
+                        </div>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">
+                        <span class="btn-text">Request Kiro Pro Access</span>
+                        <span class="btn-loader" style="display: none;">⏳ Analyzing...</span>
+                    </button>
+                </form>
+                
+                <div id="check-credits-result" class="result" style="display: none;"></div>
+            </div>
+        </div>
+
+        <footer>
+            <p>Powered by AWS Lambda, API Gateway, Bedrock, and CloudFront</p>
+        </footer>
+    </div>
+
+    <script src="config.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
