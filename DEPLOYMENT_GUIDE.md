@@ -130,7 +130,9 @@ aws cloudformation describe-stacks \
   --output text
 ```
 
-Visit: `https://<cloudfront-id>.cloudfront.net/frontend/`
+Visit: `https://<cloudfront-id>.cloudfront.net/`
+
+**Note**: The CloudFront distribution includes `DefaultRootObject: index.html`, so accessing the root URL will automatically serve the index page.
 
 ## Current Configuration
 
@@ -159,9 +161,12 @@ Visit: `https://<cloudfront-id>.cloudfront.net/frontend/`
 - **Parameter Store**: Secure configuration storage
 
 ### Parameter Store Paths
-- `/kiro/kiro-user-management-api/api-key` - API key (SecureString)
+- `/kiro/kiro-user-management-api/api-key` - API key (for reference only, not used by API Gateway)
 - `/kiro/kiro-user-management-api/bedrock-prompt` - Bedrock system prompt
 - `/kiro/kiro-user-management-api/kiro-pro-group-id` - Kiro Pro group ID
+- `/kiro/kiro-user-management-frontend/api-endpoint` - API endpoint URL
+
+**Important**: The API key in Parameter Store is for reference/retrieval only. API Gateway uses the key set during CloudFormation deployment via the `ApiKey` resource.
 
 ## Common Commands
 
@@ -173,13 +178,36 @@ aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
   --output text
 
-# Get API key
+# Get API key (from Parameter Store - for reference only)
 aws ssm get-parameter \
   --name /kiro/kiro-user-management-api/api-key \
   --with-decryption \
   --query 'Parameter.Value' \
   --output text
 ```
+
+### Rotate API Key
+```bash
+# Generate new secure API key
+NEW_API_KEY=$(openssl rand -base64 32 | tr -d '/+=' | cut -c1-32)
+echo "New API Key: $NEW_API_KEY"
+
+# Get Identity Center instance ARN
+INSTANCE_ARN=$(aws sso-admin list-instances --query 'Instances[0].InstanceArn' --output text)
+echo "Instance ARN: $INSTANCE_ARN"
+
+# Delete existing stack (required due to API key name immutability)
+aws cloudformation delete-stack --stack-name kiro-user-management-api
+aws cloudformation wait stack-delete-complete --stack-name kiro-user-management-api
+
+# Redeploy with new API key
+./deploy-backend.sh -f "$INSTANCE_ARN" "$NEW_API_KEY"
+
+# Update frontend with new API endpoint (if changed)
+./upload-frontend.sh
+```
+
+**Why delete and recreate?** API Gateway API keys have immutable names. Updating the stack with a new key value attempts to create a new key with the same name, which fails. The Parameter Store value is only for reference - it doesn't control API authentication.
 
 ### Update Bedrock Prompt
 ```bash
@@ -297,9 +325,23 @@ aws logs filter-log-events \
 ```
 
 ### API Gateway 403 Errors
-- Verify API key is correct
+- Verify API key is correct (retrieve from Parameter Store)
 - Check usage plan limits haven't been exceeded
 - Ensure `x-api-key` header is included in request
+- **Note**: Updating the API key in Parameter Store does NOT change authentication - you must redeploy the stack
+
+### CloudFront AccessDenied Errors
+- Ensure `DefaultRootObject: index.html` is set in CloudFront distribution
+- Verify S3 bucket policy allows CloudFront OAC access
+- Check that frontend files are uploaded to S3 bucket root (not in a subfolder)
+- Wait 10-15 minutes for CloudFront distribution to fully deploy
+
+### Frontend Error Messages
+The frontend now provides specific error messages:
+- **403 Forbidden**: "Invalid API key. Please check your API key and try again."
+- **429 Too Many Requests**: "Rate limit exceeded. Please wait a moment and try again."
+- **Network Errors**: "Unable to connect to the API. Please check your internet connection."
+- **Other HTTP Errors**: Specific messages based on status code (400, 500, etc.)
 
 ### Bedrock Access Issues
 - Verify Bedrock access is enabled in us-west-2 region
@@ -326,13 +368,39 @@ aws cloudformation delete-stack --stack-name kiro-user-management-api
 
 ## Security Best Practices
 
-1. **Rotate API Keys Regularly**: Update the API key parameter and redeploy
-2. **Monitor Usage**: Check CloudWatch metrics for unusual activity
-3. **Review S3 Audit Trail**: Periodically review stored screenshots
-4. **Limit API Key Distribution**: Only share with authorized users
-5. **Enable CloudTrail**: Track all API calls for compliance
-6. **Use HTTPS Only**: Never access the API over HTTP
-7. **Review IAM Permissions**: Ensure Lambda roles follow least privilege
+1. **Rotate API Keys Regularly**: 
+   - Generate new key: `openssl rand -base64 32 | tr -d '/+=' | cut -c1-32`
+   - Delete and recreate stack with new key (see "Rotate API Key" section)
+   - Distribute new key to authorized users
+   
+2. **Monitor Usage**: 
+   - Check CloudWatch metrics for unusual activity
+   - Review API Gateway usage plan metrics
+   - Set up CloudWatch alarms for rate limit breaches
+   
+3. **Review S3 Audit Trail**: 
+   - Periodically review stored screenshots in S3
+   - Screenshots are automatically deleted after 90 days
+   
+4. **Limit API Key Distribution**: 
+   - Only share with authorized users
+   - Users enter API key in web UI (not embedded in frontend)
+   
+5. **Enable CloudTrail**: 
+   - Track all API calls for compliance
+   - Monitor CloudFormation stack changes
+   
+6. **Use HTTPS Only**: 
+   - CloudFront enforces HTTPS (redirect-to-https)
+   - Never access the API over HTTP
+   
+7. **Review IAM Permissions**: 
+   - Ensure Lambda roles follow least privilege
+   - Regularly audit IAM policies
+   
+8. **CloudFront Security**:
+   - Origin Access Control (OAC) prevents direct S3 access
+   - S3 bucket is not publicly accessible
 
 ## Cost Optimization
 
