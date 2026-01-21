@@ -30,6 +30,7 @@ Resources:
       DistributionConfig:
         Enabled: true
         Comment: !Sub 'CloudFront distribution for ${AWS::StackName}'
+        DefaultRootObject: index.html
         Origins:
           - Id: S3Origin
             DomainName: !Sub '${S3BucketName}.s3.${AWS::Region}.amazonaws.com'
